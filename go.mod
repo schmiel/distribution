@@ -20,6 +20,8 @@ require (
 	github.com/docker/go-metrics v0.0.0-20180209012529-399ea8c73916
 	github.com/docker/libtrust v0.0.0-20150114040149-fa567046d9b1
 	github.com/garyburd/redigo v0.0.0-20150301180006-535138d7bcd7
+	github.com/go-stack/stack v1.8.0 // indirect
+	github.com/golang/snappy v0.0.1 // indirect
 	github.com/gorilla/handlers v0.0.0-20150720190736-60c7bfde3e33
 	github.com/gorilla/mux v1.7.2
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
@@ -42,9 +44,12 @@ require (
 	github.com/spf13/cobra v0.0.3
 	github.com/spf13/pflag v1.0.3 // indirect
 	github.com/stretchr/testify v1.3.0 // indirect
+	github.com/xdg/scram v0.0.0-20180814205039-7eeb5667e42c // indirect
+	github.com/xdg/stringprep v1.0.0 // indirect
 	github.com/yvasiyarov/go-metrics v0.0.0-20140926110328-57bccd1ccd43 // indirect
 	github.com/yvasiyarov/gorelic v0.0.0-20141212073537-a9bba5b9ab50
 	github.com/yvasiyarov/newrelic_platform_go v0.0.0-20140908184405-b21fdbd4370f // indirect
+	go.mongodb.org/mongo-driver v1.1.2
 	golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2
 	golang.org/x/net v0.0.0-20190619014844-b5b0513f8c1b // indirect
 	golang.org/x/oauth2 v0.0.0-20190604053449-0f29369cfe45
