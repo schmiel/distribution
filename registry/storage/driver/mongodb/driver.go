@@ -30,8 +30,8 @@ func init() {
 type mongodbDriverFactory struct{}
 
 type driver struct {
-	session *mgo.Session
-	db      *mgo.Database
+	rootSession *mgo.Session
+	dbName      string
 }
 
 // baseEmbed allows us to hide the Base embed.
@@ -164,8 +164,8 @@ func New(url, databaseName string, config *sessionConfig) (*Driver, error) {
 	}
 	session.SetSafe(config.safe)
 	d := &driver{
-		session: session,
-		db:      session.DB(databaseName),
+		rootSession: session,
+		dbName:      databaseName,
 	}
 	isShard, err := isShardEnvironment(d)
 	if err != nil {
@@ -182,7 +182,9 @@ func New(url, databaseName string, config *sessionConfig) (*Driver, error) {
 
 func isShardEnvironment(d *driver) (bool, error) {
 	var serverStatus serverStatusEntry
-	err := d.session.DB("admin").Run(bson.M{"serverStatus": 1}, &serverStatus)
+	session := d.getSession()
+	defer session.Close()
+	err := session.DB("admin").Run(bson.M{"serverStatus": 1}, &serverStatus)
 	if err != nil {
 		return false, err
 	}
@@ -206,7 +208,9 @@ func initShard(d *driver) error {
 }
 
 func createGridFSDatabase(d *driver) error {
-	count, err := d.GridFS().Find(bson.M{}).Count()
+	session := d.getSession()
+	defer session.Close()
+	count, err := d.gridFS(session).Find(bson.M{}).Count()
 	if err != nil {
 		return err
 	}
@@ -227,19 +231,21 @@ func createGridFSDatabase(d *driver) error {
 
 func enableDatabaseSharding(d *driver) error {
 	var configEntries []databaseConfigEntry
-	findConfigError := d.session.DB("config").C("databases").Find(bson.M{"_id": d.db.Name}).All(&configEntries)
+	session := d.getSession()
+	defer session.Close()
+	findConfigError := session.DB("config").C("databases").Find(bson.M{"_id": d.dbName}).All(&configEntries)
 	if findConfigError != nil {
 		return findConfigError
 	}
 	if len(configEntries) != 1 {
 		return storagedriver.Error{
 			DriverName: d.Name(),
-			Enclosed:   errors.New("Cannot find database '" + d.db.Name + "' configuration"),
+			Enclosed:   errors.New("Cannot find database '" + d.dbName + "' configuration"),
 		}
 	}
 	if !configEntries[0].Partitioned {
 		result := bson.M{}
-		err := d.session.DB("admin").Run(bson.M{"enableSharding": d.db.Name}, &result)
+		err := session.DB("admin").Run(bson.M{"enableSharding": d.dbName}, &result)
 		if err != nil {
 			return err
 		}
@@ -248,7 +254,7 @@ func enableDatabaseSharding(d *driver) error {
 }
 
 func createShardKeys(d *driver) error {
-	chunksCollection := d.db.Name + "." + fs + ".chunks"
+	chunksCollection := d.dbName + "." + fs + ".chunks"
 	err := createShardKey(d, chunksCollection, bson.D{
 		{Name: "shardCollection", Value: chunksCollection},
 		{Name: "key", Value: bson.D{
@@ -260,7 +266,7 @@ func createShardKeys(d *driver) error {
 		return err
 	}
 
-	filesCollection := d.db.Name + "." + fs + ".files"
+	filesCollection := d.dbName + "." + fs + ".files"
 	err = createShardKey(d, filesCollection, bson.D{
 		{Name: "shardCollection", Value: filesCollection},
 		{Name: "key", Value: bson.D{
@@ -276,12 +282,14 @@ func createShardKeys(d *driver) error {
 func createShardKey(d *driver, collectionName string, shardKeyCmd interface{}) error {
 	result := bson.M{}
 	var existingShardKeys []collectionsConfigEntry
-	err := d.session.DB("config").C("collections").Find(bson.M{"_id": collectionName}).All(&existingShardKeys)
+	session := d.getSession()
+	defer session.Close()
+	err := session.DB("config").C("collections").Find(bson.M{"_id": collectionName}).All(&existingShardKeys)
 	if err != nil {
 		return err
 	}
 	if len(existingShardKeys) == 0 {
-		err := d.session.DB("admin").Run(shardKeyCmd, &result)
+		err := session.DB("admin").Run(shardKeyCmd, &result)
 		if err != nil {
 			return err
 		}
@@ -314,11 +322,13 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, p string, contents []byte) error {
-	deleteErr := d.GridFS().Remove(p)
+	session := d.getSession()
+	defer session.Close()
+	deleteErr := d.gridFS(session).Remove(p)
 	if deleteErr != nil {
 		return deleteErr
 	}
-	file, err := d.GridFS().Create(p)
+	file, err := d.gridFS(session).Create(p)
 	if err != nil {
 		return err
 	}
@@ -339,9 +349,10 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	if offset < 0 {
 		return nil, storagedriver.InvalidOffsetError{Path: path, Offset: offset}
 	}
-
-	file, err := d.GridFS().Open(path)
+	session := d.getSession()
+	file, err := d.gridFS(session).Open(path)
 	if err != nil {
+		session.Close()
 		if err == mgo.ErrNotFound {
 			return nil, storagedriver.PathNotFoundError{Path: path}
 		}
@@ -350,43 +361,51 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 
 	_, err = file.Seek(offset, 0)
 	if err != nil {
+		session.Close()
 		return nil, err
 	}
-	return file, nil
+	return d.newReader(session, file), nil
 }
 
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-	file, err := d.GridFS().Create(path)
+	session := d.getSession()
+	file, err := d.gridFS(session).Create(path)
 	if err != nil {
+		session.Close()
 		return nil, err
 	}
 
-	existingFile, err := d.GridFS().Open(path)
+	existingFile, err := d.gridFS(session).Open(path)
 	if err == nil { //file exists
 		defer existingFile.Close()
 		if append {
 			_, copyErr := io.Copy(file, existingFile)
 			if copyErr != nil {
+				session.Close()
 				return nil, copyErr
 			}
 		}
-		err := d.GridFS().Remove(path)
+		err := d.gridFS(session).Remove(path)
 		if err != nil {
+			session.Close()
 			return nil, err
 		}
 	} else {
 		if append {
+			session.Close()
 			return nil, storagedriver.PathNotFoundError{Path: path}
 		}
 	}
-	return d.newWriter(file), nil
+	return d.newWriter(session, file), nil
 }
 
 // Stat returns info about the provided path.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	file, err := d.GridFS().Open(path)
+	session := d.getSession()
+	defer session.Close()
+	file, err := d.gridFS(session).Open(path)
 	if err != nil {
 		if err == mgo.ErrNotFound {
 			return dirStat(d, path)
@@ -408,7 +427,9 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 func dirStat(d *driver, path string) (storagedriver.FileInfo, error) {
 	var files []gridFsEntry
-	findErr := d.GridFS().Find(bson.M{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + ".*"}}}).All(&files)
+	session := d.getSession()
+	defer session.Close()
+	findErr := d.gridFS(session).Find(bson.M{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + ".*"}}}).All(&files)
 	if findErr != nil {
 		return nil, findErr
 	}
@@ -429,7 +450,9 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 	if !strings.HasSuffix(path, separator) {
 		path += separator
 	}
-	err := d.GridFS().Find(bson.M{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + ".*"}}}).All(&files)
+	session := d.getSession()
+	defer session.Close()
+	err := d.gridFS(session).Find(bson.M{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + ".*"}}}).All(&files)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +480,9 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-	destFile, err := d.GridFS().Create(destPath)
+	session := d.getSession()
+	defer session.Close()
+	destFile, err := d.gridFS(session).Create(destPath)
 	if err != nil {
 		return err
 	}
@@ -470,7 +495,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 	if copyErr != nil {
 		return copyErr
 	}
-	removeErr := d.GridFS().Remove(sourcePath)
+	removeErr := d.gridFS(session).Remove(sourcePath)
 	if removeErr != nil {
 		return removeErr
 	}
@@ -480,7 +505,9 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
 	var files []gridFsEntry
-	err := d.GridFS().Find(bson.M{"$or": []bson.M{
+	session := d.getSession()
+	defer session.Close()
+	err := d.gridFS(session).Find(bson.M{"$or": []bson.M{
 		{"filename": bson.M{"$regex": bson.RegEx{Pattern: path + "/.*"}}},
 		{"filename": bson.M{"$eq": path}},
 	}}).All(&files)
@@ -491,7 +518,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
 	for _, file := range files {
-		err := d.GridFS().RemoveId(file.ID)
+		err := d.gridFS(session).RemoveId(file.ID)
 		if err != nil {
 			return err
 		}
@@ -511,19 +538,19 @@ func (d *driver) Walk(ctx context.Context, path string, f storagedriver.WalkFn) 
 	return storagedriver.WalkFallback(ctx, d, path, f)
 }
 
-func (d *driver) GridFS() *mgo.GridFS {
-	err := d.session.Ping()
-	if err != nil {
-		logrus.Errorf("error while trying to reach mongodb, refreshing connection: %v", err)
-		d.session.Refresh()
-	}
-	return d.db.GridFS(fs)
+func (d *driver) getSession() *mgo.Session {
+	return d.rootSession.Copy()
+}
+
+func (d *driver) gridFS(session *mgo.Session) *mgo.GridFS {
+	return session.DB(d.dbName).GridFS(fs)
 }
 
 //**********************************************************************************************************************
 // FileWriter implementation
 //**********************************************************************************************************************
 type writer struct {
+	session   *mgo.Session
 	driver    *driver
 	file      *mgo.GridFile
 	closed    bool
@@ -531,10 +558,11 @@ type writer struct {
 	cancelled bool
 }
 
-func (d *driver) newWriter(gridFile *mgo.GridFile) storagedriver.FileWriter {
+func (d *driver) newWriter(session *mgo.Session, gridFile *mgo.GridFile) storagedriver.FileWriter {
 	return &writer{
-		driver: d,
-		file:   gridFile,
+		session: session,
+		driver:  d,
+		file:    gridFile,
 	}
 }
 
@@ -546,7 +574,11 @@ func (w *writer) Write(p []byte) (int, error) {
 	} else if w.cancelled {
 		return 0, fmt.Errorf("already cancelled")
 	}
-	return w.file.Write(p)
+	n, err := w.file.Write(p)
+	if err != nil {
+		w.session.Close()
+	}
+	return n, err
 }
 
 func (w *writer) Size() int64 {
@@ -558,7 +590,9 @@ func (w *writer) Close() error {
 		return fmt.Errorf("already closed")
 	}
 	w.closed = true
-	return w.file.Close()
+	err := w.file.Close()
+	w.session.Close()
+	return err
 }
 
 func (w *writer) Cancel() error {
@@ -569,7 +603,7 @@ func (w *writer) Cancel() error {
 	}
 	w.cancelled = true
 	w.file.Abort()
-
+	w.session.Close()
 	return nil
 }
 
@@ -583,4 +617,33 @@ func (w *writer) Commit() error {
 	}
 	w.committed = true
 	return nil
+}
+
+//**********************************************************************************************************************
+// FileReader implementation
+//**********************************************************************************************************************
+type reader struct {
+	session *mgo.Session
+	file    *mgo.GridFile
+}
+
+func (d *driver) newReader(session *mgo.Session, gridFile *mgo.GridFile) io.ReadCloser {
+	return &reader{
+		session: session,
+		file:    gridFile,
+	}
+}
+
+func (r *reader) Read(p []byte) (n int, err error) {
+	i, err := r.file.Read(p)
+	if err != nil {
+		r.session.Close()
+	}
+	return i, err
+}
+
+func (r *reader) Close() error {
+	err := r.file.Close()
+	r.session.Close()
+	return err
 }
